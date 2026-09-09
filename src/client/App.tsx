@@ -8,6 +8,7 @@ import { envelopeError, usePanelStore } from './store.js'
 import { SearchView } from './views/SearchView.js'
 import { TimelineView } from './views/TimelineView.js'
 import { PreviewView } from './views/PreviewView.js'
+import { jumpToSession, probeFromSnippet, type JumpSessionsLike } from './jump.js'
 import type { IndexStatus, MessageHit, TimelineNode, TimelineTurnsResponse } from '../protocol.js'
 import { useI18n, type LocaleServiceLike } from './i18n.js'
 
@@ -16,6 +17,8 @@ export interface AppProps {
   store: PanelStore
   /** 打开真实会话（由 bundle-entry 注入）。 */
   onOpenSession: (sessionId: string) => void
+  /** bundle-entry 注入的 sessions 服务（带锚点跳原会话用）。 */
+  sessions?: JumpSessionsLike
   onClose: () => void
   /** DSH 平台 Tooltip 组件（由 bundle-entry 从 primitives seed 注入）。 */
   Tooltip?: unknown
@@ -28,7 +31,7 @@ type View =
   | { name: 'timeline' }
   | { name: 'preview'; sessionId: string; seq: number }
 
-export function App({ client, store, onOpenSession, onClose, Tooltip, locale }: AppProps) {
+export function App({ client, store, onOpenSession, sessions, onClose, Tooltip, locale }: AppProps) {
   const panel = usePanelStore(store)
   const { t } = useI18n(locale)
   const [view, setView] = useState<View>({ name: 'search' })
@@ -163,6 +166,28 @@ export function App({ client, store, onOpenSession, onClose, Tooltip, locale }: 
     setView({ name: 'preview', sessionId: hit.sessionId, seq: hit.seq })
   }, [])
 
+  /** 跳转失败/降级的面板内可见提示（成功则面板关闭，用户直接落到会话）。 */
+  const [jumpNotice, setJumpNotice] = useState<string | null>(null)
+  const clearJumpNotice = useCallback(() => { setJumpNotice(null) }, [])
+
+  /** 带锚点跳原会话：切换会话并尽量定位到命中消息（主/子代理自动路由）。 */
+  const openSessionAt = useCallback((hit: { sessionId: string; seq: number; turn: number | null; snippet: string; child?: boolean; parentSessionId?: string | null }) => {
+    setJumpNotice(null)
+    void jumpToSession(sessions ?? {}, {
+      sessionId: hit.sessionId,
+      target: { seq: hit.seq, turn: hit.turn, probe: probeFromSnippet(hit.snippet) },
+      child: hit.child === true,
+      parentSessionId: hit.parentSessionId ?? null,
+    }, {
+      onClose: () => { store.close() },
+      onNotice: (message) => { setJumpNotice(message) },
+      messages: {
+        notInList: t('jumpNotInList'),
+        openFailed: t('jumpOpenFailed'),
+      },
+    })
+  }, [sessions, store, t])
+
   if (!panel.open) return null
 
   return (
@@ -215,8 +240,14 @@ export function App({ client, store, onOpenSession, onClose, Tooltip, locale }: 
         </div>
       </div>
       {rebuildResult && <div className="sex-notice">{rebuildResult}</div>}
+      {jumpNotice && (
+        <div className="sex-notice sex-notice-warn" role="status">
+          <span>{jumpNotice}</span>
+          <button type="button" className="sex-mini-btn" onClick={clearJumpNotice}>{t('dismiss')}</button>
+        </div>
+      )}
       <div className="sex-body">
-        {view.name === 'search' && <SearchView client={client} onPreview={openPreviewFromHit} onOpenSession={onOpenSession} locale={locale} />}
+        {view.name === 'search' && <SearchView client={client} onPreview={openPreviewFromHit} onOpenSession={openSessionAt} locale={locale} />}
         {view.name === 'timeline' && (timeline.status === 'loading'
           ? <div className="sex-empty">{t('loadingTimeline')}</div>
           : timeline.status === 'error'
@@ -236,7 +267,7 @@ export function App({ client, store, onOpenSession, onClose, Tooltip, locale }: 
             sessionId={view.sessionId}
             seq={view.seq}
             onBack={() => { setView({ name: 'search' }) }}
-            onOpenSession={onOpenSession}
+            onOpenSession={openSessionAt}
             locale={locale}
           />
         )}

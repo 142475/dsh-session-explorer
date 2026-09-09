@@ -96,6 +96,38 @@ test('re-indexing a session replaces rows instead of duplicating', () => {
   }
 })
 
+test('search returns child/parent routing fields for subagent sessions', () => {
+  const index = SessionIndex.open(tmpDb())
+  try {
+    index.upsertSession(meta({ sessionId: 'p1', title: '父会话' }), [msg({ sessionId: 'p1', seq: 10, textMain: '父消息' })])
+    index.upsertSession(meta({ sessionId: 'c1', title: '子代理', kind: 'child', parentSessionId: 'p1' }), [msg({ sessionId: 'c1', seq: 20, textMain: '子代理里的消息' })])
+    const hit = index.search('子代理里的消息', { limit: 10 }).items[0]
+    assert.equal(hit.child, true)
+    assert.equal(hit.parentSessionId, 'p1')
+    const parentHit = index.search('父消息', { limit: 10 }).items[0]
+    assert.equal(parentHit.child, false)
+    assert.equal(parentHit.parentSessionId, null)
+  } finally {
+    index.close()
+  }
+})
+
+test('preview returns child/parent routing fields', () => {
+  const index = SessionIndex.open(tmpDb())
+  try {
+    index.upsertSession(meta({ sessionId: 'p1', title: '父会话' }), [msg({ sessionId: 'p1', seq: 10, textMain: '父消息' })])
+    index.upsertSession(meta({ sessionId: 'c1', title: '子代理', kind: 'child', parentSessionId: 'p1' }), [msg({ sessionId: 'c1', seq: 20, textMain: '子代理里的消息' })])
+    const page = index.preview('c1', 20)
+    assert.equal(page!.child, true)
+    assert.equal(page!.parentSessionId, 'p1')
+    const parentPage = index.preview('p1', 10)
+    assert.equal(parentPage!.child, false)
+    assert.equal(parentPage!.parentSessionId, null)
+  } finally {
+    index.close()
+  }
+})
+
 test('search deduplicates identical messages across fork/continuation sessions', () => {
   const index = SessionIndex.open(tmpDb())
   try {
@@ -366,8 +398,91 @@ test('schema migration adds log_fingerprint/log_revision/subagent_kind columns t
     const version = uv.prepare('PRAGMA user_version').get()
     const cols = uv.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>
     uv.close()
-    assert.equal(version.user_version, 4)
+    assert.equal(version.user_version, DB_USER_VERSION)
     assert.ok(cols.some((c) => c.name === 'subagent_kind'))
+  } finally {
+    index.close()
+  }
+})
+
+test('v4 → v5 migration deduplicates shared fork history physically', () => {
+  const file = tmpDb()
+  // 手工造一个 v4 库：两个会话共享同一消息（物理重复）
+  const db = new DatabaseSync(file)
+  db.exec('PRAGMA application_id = ' + DB_APP_ID)
+  db.exec('PRAGMA user_version = 4')
+  db.exec(`CREATE TABLE sessions (
+    session_id TEXT PRIMARY KEY, title TEXT, cwd TEXT,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0, tool_count INTEGER NOT NULL DEFAULT 0,
+    parent_session_id TEXT, subagent_kind TEXT NOT NULL DEFAULT 'main',
+    indexed_at INTEGER NOT NULL, log_fingerprint TEXT, log_revision TEXT, error TEXT
+  ) WITHOUT ROWID`)
+  db.exec(`CREATE TABLE messages (
+    session_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL,
+    time INTEGER NOT NULL, turn INTEGER,
+    text_main TEXT NOT NULL DEFAULT '', text_tool TEXT NOT NULL DEFAULT ''
+  )`)
+  db.prepare('INSERT INTO sessions(session_id, title, cwd, created_at, updated_at, message_count, tool_count, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run('parent', '父', '/x', 1, 2, 1, 0, 1)
+  db.prepare('INSERT INTO sessions(session_id, title, cwd, created_at, updated_at, message_count, tool_count, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run('fork', '分支', '/x', 1, 2, 1, 0, 2)
+  const insert = db.prepare('INSERT INTO messages(session_id, seq, kind, time, turn, text_main, text_tool) VALUES (?, ?, ?, ?, ?, ?, ?)')
+  insert.run('parent', 10, 'user', 1000, 1, '共享消息', '')
+  insert.run('fork', 10, 'user', 1000, 1, '共享消息', '')
+  insert.run('fork', 20, 'user', 2000, 2, '分支独有', '')
+  db.close()
+
+  // open 触发迁移：3 物理行 → 2 正文 + 3 归属
+  const index = SessionIndex.open(file)
+  try {
+    const search = index.search('共享', { limit: 10 })
+    assert.equal(search.items.length, 1, 'shared message appears once')
+    assert.equal(['parent', 'fork'].includes(search.items[0].sessionId), true)
+    const both = index.search('分支独有', { limit: 10 })
+    assert.equal(both.items.length, 1)
+    assert.equal(both.items[0].sessionId, 'fork')
+    // preview/turns 走新 join 后仍正常
+    const page = index.preview('fork', 10)
+    assert.ok(page !== null)
+    assert.equal(page!.focus.textMain, '共享消息')
+    const turns = index.turns('fork', 10)
+    assert.equal(turns.length, 2)
+    // countMessages 按 归属表 计数
+    assert.equal(index.countMessages('fork'), 2)
+    assert.equal(index.countMessages('parent'), 1)
+  } finally {
+    index.close()
+  }
+})
+
+test('deleteSession keeps shared messages, removes orphans', () => {
+  const index = SessionIndex.open(tmpDb())
+  try {
+    const shared = { seq: 1, kind: 'user' as const, time: 1000, turn: 1, textMain: '两方共享', textTool: '' }
+    index.upsertSession(meta({ sessionId: 'a', title: 'A' }), [{ ...shared, sessionId: 'a' }])
+    index.upsertSession(meta({ sessionId: 'b', title: 'B' }), [{ ...shared, sessionId: 'b' }])
+    index.upsertSession(meta({ sessionId: 'a', title: 'A' }), [{ ...shared, sessionId: 'a' }, { seq: 2, kind: 'user' as const, time: 2000, turn: 1, textMain: '仅A独有', textTool: '', sessionId: 'a' }])
+    // 删 a：共享正文保留（b 还在），独有正文删除
+    index.deleteSession('a')
+    assert.equal(index.search('两方共享', { limit: 10 }).items.length, 1)
+    assert.equal(index.search('仅A独有', { limit: 10 }).items.length, 0)
+    assert.equal(index.countMessages('a'), 0)
+    assert.equal(index.countMessages('b'), 1)
+    // 删 b：共享正文也随之消失
+    index.deleteSession('b')
+    assert.equal(index.search('两方共享', { limit: 10 }).items.length, 0)
+  } finally {
+    index.close()
+  }
+})
+
+test('maintain runs optimize + checkpoint without error', () => {
+  const index = SessionIndex.open(tmpDb())
+  try {
+    index.upsertSession(meta(), [msg({ seq: 1, textMain: '维护测试' })])
+    const result = index.maintain()
+    assert.equal(result.optimized, true)
   } finally {
     index.close()
   }

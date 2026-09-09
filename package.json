@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-explorer",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "DSH Web 插件：会话消息级全文检索与会话总览浏览器。检索具体到某一条消息（正文/工具名/参数/错误摘要），会话总览浏览全部会话，只读上下文预览。",
   "type": "module",
   "main": "lib/index.js",

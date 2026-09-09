@@ -39,6 +39,13 @@ export interface MessageHit {
   snippet: string
   /** 命中的列：main 或 tool。 */
   hitField: 'main' | 'tool'
+  /**
+   * 会话是否为子代理会话（索引库 sessions.subagent_kind === 'child'）。
+   * 打开此类会话必须走 openSubagent 父地址（引擎拒绝直接 open 子会话）。
+   */
+  child?: boolean
+  /** 子代理会话的父会话 id（child === true 时供 openSubagent 用；可能为 null）。 */
+  parentSessionId?: string | null
 }
 
 /** 时间线节点（会话级摘要，不加载消息正文）。 */
@@ -90,6 +97,10 @@ export interface PreviewPage {
   sessionId: string
   sessionTitle: string | null
   cwd: string | null
+  /** 会话是否为子代理会话（打开需走 openSubagent 父地址）。 */
+  child: boolean
+  /** 子代理会话的父会话 id（child 时供 openSubagent 用；可能为 null）。 */
+  parentSessionId: string | null
   focus: IndexableMessage
   context: IndexableMessage[]
 }

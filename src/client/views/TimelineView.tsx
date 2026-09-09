@@ -7,6 +7,7 @@ import { useMemo, useState, useCallback, useEffect, useRef } from 'react'
 import type { MessageKind, TimelineNode, TimelineTurnsResponse, TimelineNodeKind, MessageHit } from '../../protocol.js'
 import { useI18n, type LocaleServiceLike } from '../i18n.js'
 import { envelopeError, type ExplorerClient } from '../store.js'
+import { scrollToPanelMessage, probeFromSnippet } from '../jump.js'
 
 export interface TimelineViewProps {
   client: ExplorerClient
@@ -63,9 +64,29 @@ export function TimelineView({ client, nodes, selectedSessionId, turns, onSelect
   const [scrollTime, setScrollTime] = useState<string>('')
   const detailRef = useRef<HTMLDivElement | null>(null)
   const listRef = useRef<HTMLDivElement | null>(null)
+  /** 会话切换时重置的命中定位请求（seq + 探针 + 结果状态）。 */
+  const [hitLocate, setHitLocate] = useState<{ seq: number; probe: string; done: boolean; failed: boolean } | null>(null)
 
   // 会话切换时重置消息展开态（旧会话的 seq 在新会话里可能指向别的消息）
   useEffect(() => { setExpandedSeq(null) }, [selectedSessionId])
+
+  // 命中定位：turns 渲染完成后滚动到目标消息并高亮（badge 点击 → 详情定位）
+  useEffect(() => {
+    if (turns.status !== 'ready' || hitLocate === null || hitLocate.done) return
+    const list = listRef.current
+    if (list === null) return
+    // seq 直配失败时用探针重试一次（渲染受动画影响的延迟帧）
+    const timer = window.setTimeout(() => {
+      const first = scrollToPanelMessage(list, hitLocate.seq, hitLocate.probe)
+      if (first) { setHitLocate((prev) => (prev !== null && prev.seq === hitLocate.seq ? { ...prev, done: true, failed: false } : prev)); return }
+      const retry = window.setTimeout(() => {
+        const ok = scrollToPanelMessage(list, hitLocate.seq, hitLocate.probe)
+        setHitLocate((prev) => (prev !== null && prev.seq === hitLocate.seq ? { ...prev, done: true, failed: !ok } : prev))
+      }, 150)
+      return () => window.clearTimeout(retry)
+    }, 80)
+    return () => window.clearTimeout(timer)
+  }, [turns.status, turns.data, hitLocate])
 
   const selected = selectedSessionId === null || selectedSessionId === '' ? null : nodes.find(n => n.sessionId === selectedSessionId) ?? null
 
@@ -159,6 +180,16 @@ export function TimelineView({ client, nodes, selectedSessionId, turns, onSelect
     setWorkspaces(list => list.includes(cwd) ? list.filter(x => x !== cwd) : [...list, cwd])
   }, [])
 
+  /** 命中 badge 点击：确保该会话详情打开，并把命中数最多的那条定位出来。 */
+  const locateHit = useCallback((node: TimelineNode) => {
+    const nodeHits = hits.filter(h => h.sessionId === node.sessionId)
+    if (nodeHits.length === 0) return
+    // 选文本最长的命中（探针最可靠）；并列时取最新
+    const best = [...nodeHits].sort((a, b) => b.snippet.length - a.snippet.length || b.time - a.time)[0]
+    setHitLocate({ seq: best.seq, probe: probeFromSnippet(best.snippet), done: false, failed: false })
+    if (selectedSessionId !== node.sessionId) onSelectSession(node.sessionId)
+  }, [hits, selectedSessionId, onSelectSession])
+
   if (nodes.length === 0) return <div className="sex-empty">{t('timelineEmpty')}</div>
   return <div className="sex-timeline-overview">
     <div className="sex-timeline-toolbar">
@@ -202,7 +233,7 @@ export function TimelineView({ client, nodes, selectedSessionId, turns, onSelect
           const nodeHits = hits.filter(h => h.sessionId === node.sessionId)
           return (
           <button key={node.sessionId} type="button" style={{ animationDelay: Math.min(index * 14, 240) + 'ms' }} className={'sex-session-card sex-session-card-' + node.kind + (selected !== null && selectedSessionId === node.sessionId ? ' sex-session-card-selected' : '')} onClick={() => { onSelectSession(selectedSessionId === node.sessionId ? '' : node.sessionId) }}>
-          <div className="sex-session-card-head"><strong>{node.title ?? node.sessionId.slice(0, 12)}</strong>{nodeHits.length > 0 && <span className="sex-card-hit-badge" title={t('timelineHitJumpAria')} aria-label={t('timelineHitJumpAria')}>{nodeHits.length}</span>}<span className={'sex-kind-badge sex-kind-badge-' + node.kind}>{t(node.kind === 'child' ? 'timelineChild' : 'timelineMain')}</span></div>
+          <div className="sex-session-card-head"><strong>{node.title ?? node.sessionId.slice(0, 12)}</strong>{nodeHits.length > 0 && <span role="button" tabIndex={0} className="sex-card-hit-badge" title={t('timelineHitJumpAria')} aria-label={t('timelineHitJumpAria')} onClick={(event) => { event.stopPropagation(); locateHit(node) }} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); locateHit(node) } }}>{nodeHits.length}</span>}<span className={'sex-kind-badge sex-kind-badge-' + node.kind}>{t(node.kind === 'child' ? 'timelineChild' : 'timelineMain')}</span></div>
           <div className="sex-session-card-meta">{shortCwd(node.cwd) || t('timelineUnknownDir')} · {formatTime(node.updatedAt)}</div>
           <div className="sex-session-card-stats">{t('timelineMessages', { n: String(node.messageCount) })} · {t('timelineTools', { n: String(node.toolCount) })}</div>
           <div className="sex-session-card-summary">{node.latestMessage?.text || node.firstMessage?.text || t('timelineNoSummary')}</div>
@@ -233,7 +264,7 @@ export function TimelineView({ client, nodes, selectedSessionId, turns, onSelect
           {turns.status === 'ready' && turns.data?.turns.map(message => {
             const isExpanded = expandedSeq === message.seq
             return (
-            <div key={message.seq} data-mtime={String(message.time)} className="sex-message-summary">
+            <div key={message.seq} data-mtime={String(message.time)} data-mseq={String(message.seq)} className="sex-message-summary">
               <button type="button" className="sex-message-summary-toggle" aria-expanded={isExpanded} onClick={() => setExpandedSeq(isExpanded ? null : message.seq)}><span className="sex-kind-dot" style={{ background: KIND_COLORS[message.kind] }} /><span className="sex-kind-text" style={{ color: KIND_COLORS[message.kind] }}>{kindLabel(message.kind, t)}</span><span className="sex-message-summary-time">{formatTime(message.time)}</span><span>#{message.seq}</span><span className="sex-message-summary-text">{message.text || t('timelineNoSummary')}</span><span aria-hidden="true" className={'sex-message-summary-arrow' + (isExpanded ? ' sex-message-summary-arrow-open' : '')}>▸</span></button>
               <div className={'sex-message-expanded-wrap' + (isExpanded ? ' sex-message-expanded-open' : '')}>
                 <div className="sex-message-expanded">{message.text || t('timelineNoSummary')}</div>
@@ -242,6 +273,7 @@ export function TimelineView({ client, nodes, selectedSessionId, turns, onSelect
             )
           })}
           {turns.status === 'ready' && turns.data?.turns.length === 0 && <div className="sex-empty">{t('timelineNoTurns')}</div>}
+          {turns.status === 'ready' && hitLocate?.done && hitLocate.failed && <div className="sex-hit-locate-status" role="status">{t('timelineHitNotFound')}</div>}
         </div>
       </aside>}
     </div>

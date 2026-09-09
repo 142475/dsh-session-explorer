@@ -43,6 +43,8 @@ interface ConnectionLike {
 }
 interface SessionsLike {
   open?: (id: string) => void
+  /** useSessions 标准 feed（jumpToSession 读 current 判定选中完成）。 */
+  list?: { getSnapshot?: () => { current?: string } }
 }
 interface ClientCtxLike {
   connection?: ConnectionLike
@@ -170,6 +172,7 @@ function mountPanel(
   client: ExplorerClient,
   store: PanelStore,
   onOpenSession: (id: string) => void,
+  sessions: SessionsLike | undefined,
   reactDomClient: { createRoot: (el: Element) => ReactRootLike },
   Tooltip?: unknown,
   locale?: unknown,
@@ -196,6 +199,7 @@ function mountPanel(
       client,
       store,
       onOpenSession,
+      sessions: sessions as import('./jump.js').JumpSessionsLike | undefined,
       onClose: () => { store.close() },
       Tooltip,
       locale: locale as LocaleServiceLike | undefined,
@@ -290,7 +294,7 @@ export function factory(require: (spec: string) => unknown) {
     applyEntry()
     const unsubscribeLocale = locale?.subscribe?.(applyEntry)
 
-    const disposePanel = mountPanel(client, store, onOpenSession, reactDomClient, Tooltip, locale)
+    const disposePanel = mountPanel(client, store, onOpenSession, ctx.sessions, reactDomClient, Tooltip, locale)
     ctx.effect?.(() => () => {
       unsubscribeLocale?.()
       disposePanel()

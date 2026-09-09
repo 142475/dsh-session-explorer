@@ -25,8 +25,8 @@ import { makeSnippet } from './transcript.js'
 
 /** 私有库标记。 */
 export const DB_APP_ID = 0x44534530 // 'DSE0'
-/** 结构版本：schema 变更时 +1。 */
-export const DB_USER_VERSION = 4
+/** 结构版本：schema 变更时 +1。v5 = 物理去重（正文表 + 会话归属映射）。 */
+export const DB_USER_VERSION = 5
 
 /** 每会话元数据（同步层传入）。 */
 export interface SessionMeta {
@@ -90,8 +90,12 @@ const SCHEMA = [
     log_revision TEXT,
     error TEXT
   ) WITHOUT ROWID`,
+  // v5 物理去重：唯一正文行（fork/续接会话共享父历史 → 同一 (seq,kind,正文)
+  // 只存一份，归属关系见 session_messages）。content_key = seq:kind:text_main
+  // 的哈希键（搜索层原 GROUP BY 口径的物理化）。
   `CREATE TABLE IF NOT EXISTS messages (
-    session_id TEXT NOT NULL,
+    content_id INTEGER PRIMARY KEY,
+    content_key TEXT NOT NULL UNIQUE,
     seq INTEGER NOT NULL,
     kind TEXT NOT NULL,
     time INTEGER NOT NULL,
@@ -99,7 +103,15 @@ const SCHEMA = [
     text_main TEXT NOT NULL DEFAULT '',
     text_tool TEXT NOT NULL DEFAULT ''
   )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq)`,
+  `CREATE TABLE IF NOT EXISTS session_messages (
+    session_id TEXT NOT NULL,
+    content_id INTEGER NOT NULL,
+    PRIMARY KEY (session_id, content_id)
+  ) WITHOUT ROWID`,
+  // ⚠ 反查归属（按 content_id 找 session）是搜索热路径；缺此索引时 SQLite
+  // 全表扫 session_messages（810 会话 × 5.5 万映射 ≈ 670ms/查询）。
+  `CREATE INDEX IF NOT EXISTS idx_session_messages_content ON session_messages(content_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_session_messages_session ON session_messages(session_id)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_time ON messages(time)`,
   `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     text_main, text_tool,
@@ -108,6 +120,11 @@ const SCHEMA = [
     tokenize='trigram'
   )`,
 ]
+
+/** 消息内容键：搜索层去重口径（seq+kind+正文）的物理主键。 */
+function contentKeyOf(message: IndexableMessage): string {
+  return message.seq + ':' + message.kind + ':' + message.textMain
+}
 
 export interface SearchOptions {
   kinds?: MessageKind[]
@@ -155,6 +172,14 @@ export class SessionIndex {
       }
       db.exec('PRAGMA journal_mode = WAL')
       db.exec('PRAGMA synchronous = NORMAL')
+      // v4 → v5 迁移：旧 messages 表按 session 存（有 session_id 列、无 content_key），
+      // 必须在跑 SCHEMA 前改表（messages 表结构不同，CREATE IF NOT EXISTS 会静默跳过）。
+      if (existed && userVersion >= 1 && userVersion < 5) {
+        SessionIndex.migrateV4ToV5(db)
+        // 迁移删除约 8 成物理重复行，空间留在 freelist；VACUUM 才真正归还磁盘
+        // （895MB 实测 → 164MB）。失败不阻塞启动，可日后手动维护。
+        try { db.exec('VACUUM') } catch { /* 大库 VACUUM 失败不阻塞 */ }
+      }
       for (const stmt of SCHEMA) db.exec(stmt)
       // Schema reconciliation is intentionally column-based, not version-only.
       // A v4 database may have been stamped before parent_session_id was introduced;
@@ -177,6 +202,40 @@ export class SessionIndex {
       try { db.close() } catch { /* already closed */ }
       throw error
     }
+  }
+
+  /**
+   * v4 → v5 物理去重迁移：旧 messages（每 session 一份正文）改为
+   * messages（唯一正文）+ session_messages（归属映射）。在打开事务里
+   * 重命名旧表 → 建新表 → INSERT SELECT 去重回填 → 重建 FTS → 清旧表。
+   * 数据量 44 万行级别时约需数十秒；失败整体回滚，库保持 v4 可回退。
+   */
+  private static migrateV4ToV5(db: DatabaseSync): void {
+    db.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE messages RENAME TO messages_v4;
+      DROP TABLE IF EXISTS messages_fts;
+    `)
+    for (const stmt of SCHEMA) db.exec(stmt)
+    db.exec(`
+      INSERT INTO messages(content_key, seq, kind, time, turn, text_main, text_tool)
+      SELECT seq || ':' || kind || ':' || text_main, seq, kind, time, turn, text_main, text_tool
+      FROM messages_v4
+      GROUP BY seq, kind, text_main
+      HAVING MIN(rowid) = rowid;
+
+      INSERT INTO session_messages(session_id, content_id)
+      SELECT v.session_id, m.content_id
+      FROM messages_v4 v
+      JOIN messages m ON m.seq = v.seq AND m.kind = v.kind AND m.text_main = v.text_main;
+
+      INSERT INTO messages_fts(rowid, text_main, text_tool)
+      SELECT content_id, text_main, text_tool FROM messages;
+
+      DROP TABLE messages_v4;
+      PRAGMA user_version = ${DB_USER_VERSION};
+      COMMIT;
+    `)
   }
 
   /** 0600 权限（主文件 + WAL 附属文件）。 */
@@ -208,25 +267,45 @@ export class SessionIndex {
     return [...raw.replace(/\s+/g, '')].length < 3
   }
 
-  /** 全量替换一个会话的索引行（事务）。 */
+  /** 全量替换一个会话的索引行（事务）：正文 upsert + 归属重建 + FTS 增量维护。 */
   upsertSession(meta: SessionMeta, messages: IndexableMessage[]): void {
     const now = Date.now()
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      this.db.prepare(`INSERT INTO messages_fts(messages_fts, rowid, text_main, text_tool)
-        SELECT 'delete', rowid, text_main, text_tool FROM messages WHERE session_id = ?`).run(meta.sessionId)
-      this.db.prepare('DELETE FROM messages WHERE session_id = ?').run(meta.sessionId)
+      // 1) 摘掉该会话现有归属；正文若无任何归属者则连正文与 FTS 行一起删
+      const orphans = this.db.prepare(`
+        SELECT m.content_id, m.text_main, m.text_tool FROM messages m
+        WHERE m.content_id IN (SELECT content_id FROM session_messages WHERE session_id = ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM session_messages sm2
+            WHERE sm2.content_id = m.content_id AND sm2.session_id != ?
+          )`).all(meta.sessionId, meta.sessionId) as Array<{ content_id: number; text_main: string; text_tool: string }>
+      for (const orphan of orphans) {
+        this.db.prepare(`INSERT INTO messages_fts(messages_fts, rowid, text_main, text_tool)
+          VALUES ('delete', ?, ?, ?)`).run(orphan.content_id, orphan.text_main, orphan.text_tool)
+        this.db.prepare('DELETE FROM messages WHERE content_id = ?').run(orphan.content_id)
+      }
+      this.db.prepare('DELETE FROM session_messages WHERE session_id = ?').run(meta.sessionId)
 
-      const insert = this.db.prepare(`INSERT INTO messages(session_id, seq, kind, time, turn, text_main, text_tool)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      const insertFts = this.db.prepare(`INSERT INTO messages_fts(rowid, text_main, text_tool) VALUES (?, ?, ?)`)
+      // 2) 正文 upsert + 归属 + FTS 增量插入（仅新正文行进 FTS）
+      const insertMessage = this.db.prepare(`INSERT INTO messages(content_key, seq, kind, time, turn, text_main, text_tool)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(content_key) DO NOTHING`)
+      const findId = this.db.prepare('SELECT content_id FROM messages WHERE content_key = ?')
+      const insertFts = this.db.prepare('INSERT INTO messages_fts(rowid, text_main, text_tool) VALUES (?, ?, ?)')
+      const linkMessage = this.db.prepare('INSERT OR IGNORE INTO session_messages(session_id, content_id) VALUES (?, ?)')
       let toolCount = 0
       for (const message of messages) {
-        const result = insert.run(
-          message.sessionId, message.seq, message.kind, message.time,
-          message.turn, message.textMain, message.textTool,
-        )
-        insertFts.run(result.lastInsertRowid, message.textMain, message.textTool)
+        const key = contentKeyOf(message)
+        // changes>0 = 正文新插入；0 = 已由其他会话先入库（FTS 已有，跳过）。
+        // ⚠ 不能用 SELECT ... FROM messages_fts WHERE rowid 判定——external-content
+        // 模式下该查询透传 content 表，永远"存在"，会导致倒排漏写、MATCH 全空。
+        const { changes } = insertMessage.run(key, message.seq, message.kind, message.time, message.turn, message.textMain, message.textTool) as { changes: number }
+        const contentId = Number((findId.get(key) as { content_id: number }).content_id)
+        linkMessage.run(meta.sessionId, contentId)
+        if (changes > 0) {
+          insertFts.run(contentId, message.textMain, message.textTool)
+        }
         if (message.kind === 'tool') toolCount++
       }
 
@@ -247,13 +326,23 @@ export class SessionIndex {
     }
   }
 
-  /** 删除一个会话的全部索引行。 */
+  /** 删除一个会话的索引行：归属清除 + 孤儿正文与 FTS 行清除。 */
   deleteSession(sessionId: string): void {
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      this.db.prepare(`INSERT INTO messages_fts(messages_fts, rowid, text_main, text_tool)
-        SELECT 'delete', rowid, text_main, text_tool FROM messages WHERE session_id = ?`).run(sessionId)
-      this.db.prepare('DELETE FROM messages WHERE session_id = ?').run(sessionId)
+      const orphans = this.db.prepare(`
+        SELECT m.content_id, m.text_main, m.text_tool FROM messages m
+        WHERE m.content_id IN (SELECT content_id FROM session_messages WHERE session_id = ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM session_messages sm2
+            WHERE sm2.content_id = m.content_id AND sm2.session_id != ?
+          )`).all(sessionId, sessionId) as Array<{ content_id: number; text_main: string; text_tool: string }>
+      for (const orphan of orphans) {
+        this.db.prepare(`INSERT INTO messages_fts(messages_fts, rowid, text_main, text_tool)
+          VALUES ('delete', ?, ?, ?)`).run(orphan.content_id, orphan.text_main, orphan.text_tool)
+        this.db.prepare('DELETE FROM messages WHERE content_id = ?').run(orphan.content_id)
+      }
+      this.db.prepare('DELETE FROM session_messages WHERE session_id = ?').run(sessionId)
       this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId)
       this.db.exec('COMMIT')
     } catch (error) {
@@ -293,36 +382,59 @@ export class SessionIndex {
       params.push(options.cwd)
     }
 
-    // 去重：DSH fork/续接会话共享父历史，同一条消息（相同 seq+kind+正文）会在
-    // 多个 session 各存一份。用 GROUP BY (seq, kind, text_main) 保留每组一行；
-    // SQLite bare-column 特性会保留每组第一行，配合 ORDER BY 优先留标题非空、
-    // indexed_at 更晚的 session（fork 后的会话通常更有意义）。
-    // 注意：bm25 不能出现在窗口函数子查询内，故 GROUP BY 必须与 bm25 同层，
-    // 去重顺序由 ORDER BY 的 title/indexed_at 前缀保证。
+    // 物理去重后正文唯一，但同一正文可归属多个会话（fork/续接共享父历史）。
+    // 展示语义：每条正文只出一行，归属取 indexed_at 最新的会话（原 GROUP BY 口径）。
+    // 性能：FTS 分支先取候选 rowid（内层 LIMIT 随翻页扩大），窗口函数只跑小集合——
+    // 对 5886 命中从 ~950ms 降到 ~17ms；非 FTS（短词）分支同构。
+    const candidateBudget = (offset + limit) * 8
+    // short（LIKE）分支的首条件消耗 params[0..1] 两个占位符；FTS 分支只消耗 1 个。
+    const extraWhere = where.slice(1)
+    const extraParams = short ? params.slice(2) : params.slice(1)
+    const extraClause = extraWhere.length > 0 ? 'WHERE ' + extraWhere.join(' AND ') : ''
     const rows = (short
-      ? this.db.prepare(`SELECT
-          m.session_id, m.seq, m.kind, m.time, m.turn,
-          m.text_main, m.text_tool,
-          s.title, s.cwd,
-          0 AS rank
-        FROM messages m
-        LEFT JOIN sessions s ON s.session_id = m.session_id
-        WHERE ${where.join(' AND ')}
-        GROUP BY m.seq, m.kind, m.text_main
-        ORDER BY s.indexed_at DESC, m.time DESC
-        LIMIT ? OFFSET ?`).all(...params, limit + 1, offset)
-      : this.db.prepare(`SELECT
-          m.session_id, m.seq, m.kind, m.time, m.turn,
-          m.text_main, m.text_tool,
-          s.title, s.cwd,
-          0 AS rank
-        FROM messages_fts f
-        JOIN messages m ON m.rowid = f.rowid
-        LEFT JOIN sessions s ON s.session_id = m.session_id
-        WHERE ${where.join(' AND ')}
-        GROUP BY m.seq, m.kind, m.text_main
-        ORDER BY s.indexed_at DESC, m.time DESC
-        LIMIT ? OFFSET ?`).all(...params, limit + 1, offset)) as Array<Record<string, unknown>>
+      ? this.db.prepare(`SELECT * FROM (
+          SELECT
+            sm.session_id, m.seq, m.kind, m.time, m.turn,
+            m.text_main, m.text_tool,
+            s.title, s.cwd, s.subagent_kind, s.parent_session_id,
+            ROW_NUMBER() OVER (
+              PARTITION BY m.content_id
+              ORDER BY s.indexed_at DESC, s.title IS NULL
+            ) AS rn,
+            COALESCE(s.indexed_at, 0) AS indexed_at,
+            0 AS rank
+          FROM (
+            SELECT rowid FROM messages
+            WHERE (text_main LIKE ? ESCAPE '\\' OR text_tool LIKE ? ESCAPE '\\') LIMIT ?
+          ) cand
+          JOIN messages m ON m.rowid = cand.rowid
+          JOIN session_messages sm ON sm.content_id = m.content_id
+          LEFT JOIN sessions s ON s.session_id = sm.session_id
+          ${extraClause}
+        ) WHERE rn = 1
+        ORDER BY indexed_at DESC, time DESC
+        LIMIT ? OFFSET ?`).all(params[0], params[0], candidateBudget, ...extraParams, limit + 1, offset)
+      : this.db.prepare(`SELECT * FROM (
+          SELECT
+            sm.session_id, m.seq, m.kind, m.time, m.turn,
+            m.text_main, m.text_tool,
+            s.title, s.cwd, s.subagent_kind, s.parent_session_id,
+            ROW_NUMBER() OVER (
+              PARTITION BY m.content_id
+              ORDER BY s.indexed_at DESC, s.title IS NULL
+            ) AS rn,
+            COALESCE(s.indexed_at, 0) AS indexed_at,
+            0 AS rank
+          FROM (
+            SELECT rowid FROM messages_fts WHERE messages_fts MATCH ? LIMIT ?
+          ) cand
+          JOIN messages m ON m.rowid = cand.rowid
+          JOIN session_messages sm ON sm.content_id = m.content_id
+          LEFT JOIN sessions s ON s.session_id = sm.session_id
+          ${extraClause}
+        ) WHERE rn = 1
+        ORDER BY indexed_at DESC, time DESC
+        LIMIT ? OFFSET ?`).all(params[0], candidateBudget, ...extraParams, limit + 1, offset)) as Array<Record<string, unknown>>
 
     const hasMore = rows.length > limit
     const page = hasMore ? rows.slice(0, limit) : rows
@@ -343,6 +455,8 @@ export class SessionIndex {
         cwd: row.cwd === null || row.cwd === undefined ? null : String(row.cwd),
         snippet: makeSnippet(source, q),
         hitField: field,
+        child: row.subagent_kind === 'child',
+        parentSessionId: row.parent_session_id == null ? null : String(row.parent_session_id),
       }
     })
     return { items, nextOffset: hasMore ? offset + limit : null }
@@ -374,10 +488,12 @@ export class SessionIndex {
 
   private timelineNode(row: Record<string, unknown>): TimelineNode {
     const sessionId = String(row.session_id)
-    const messages = this.db.prepare(`SELECT seq, kind, time, turn, text_main, text_tool
-      FROM messages WHERE session_id = ? ORDER BY time ASC, seq ASC LIMIT 1`).all(sessionId) as Array<Record<string, unknown>>
-    const latest = this.db.prepare(`SELECT seq, kind, time, turn, text_main, text_tool
-      FROM messages WHERE session_id = ? ORDER BY time DESC, seq DESC LIMIT 1`).all(sessionId) as Array<Record<string, unknown>>
+    const messages = this.db.prepare(`SELECT m.seq, m.kind, m.time, m.turn, m.text_main, m.text_tool
+      FROM session_messages sm JOIN messages m ON m.content_id = sm.content_id
+      WHERE sm.session_id = ? ORDER BY m.time ASC, m.seq ASC LIMIT 1`).all(sessionId) as Array<Record<string, unknown>>
+    const latest = this.db.prepare(`SELECT m.seq, m.kind, m.time, m.turn, m.text_main, m.text_tool
+      FROM session_messages sm JOIN messages m ON m.content_id = sm.content_id
+      WHERE sm.session_id = ? ORDER BY m.time DESC, m.seq DESC LIMIT 1`).all(sessionId) as Array<Record<string, unknown>>
     const summary = (r: Record<string, unknown> | undefined): TimelineMessageSummary | null => r === undefined ? null : ({
       seq: Number(r.seq), kind: r.kind as MessageKind, time: Number(r.time), turn: r.turn == null ? null : Number(r.turn),
       text: String(r.text_main || r.text_tool || '').slice(0, 240),
@@ -393,8 +509,9 @@ export class SessionIndex {
   /** 单会话二级时间线：按 turn 聚合的消息序列（时间升序）。 */
   turns(sessionId: string, limit = 200): TimelineTurn[] {
     const cap = Math.min(Math.max(limit, 1), 500)
-    const rows = this.db.prepare(`SELECT seq, kind, time, turn, text_main, text_tool
-      FROM messages WHERE session_id = ? ORDER BY time ASC, seq ASC LIMIT ?`).all(sessionId, cap) as Array<Record<string, unknown>>
+    const rows = this.db.prepare(`SELECT m.seq, m.kind, m.time, m.turn, m.text_main, m.text_tool
+      FROM session_messages sm JOIN messages m ON m.content_id = sm.content_id
+      WHERE sm.session_id = ? ORDER BY m.time ASC, m.seq ASC LIMIT ?`).all(sessionId, cap) as Array<Record<string, unknown>>
     return rows.map((row) => ({
       seq: Number(row.seq),
       kind: (row.kind as MessageKind),
@@ -410,18 +527,21 @@ export class SessionIndex {
     const before = Math.min(Math.max(options.before ?? 20, 0), 50)
     const after = Math.min(Math.max(options.after ?? 20, 0), 50)
 
-    const focus = this.db.prepare(`SELECT session_id, seq, kind, time, turn, text_main, text_tool
-      FROM messages WHERE session_id = ? AND seq = ?`).get(sessionId, seq) as Record<string, unknown> | undefined
+    const focus = this.db.prepare(`SELECT m.seq, m.kind, m.time, m.turn, m.text_main, m.text_tool
+      FROM session_messages sm JOIN messages m ON m.content_id = sm.content_id
+      WHERE sm.session_id = ? AND m.seq = ?`).get(sessionId, seq) as Record<string, unknown> | undefined
     if (!focus) return null
 
-    const beforeRows = this.db.prepare(`SELECT session_id, seq, kind, time, turn, text_main, text_tool
-      FROM messages WHERE session_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?`)
+    const beforeRows = this.db.prepare(`SELECT m.seq, m.kind, m.time, m.turn, m.text_main, m.text_tool
+      FROM session_messages sm JOIN messages m ON m.content_id = sm.content_id
+      WHERE sm.session_id = ? AND m.seq < ? ORDER BY m.seq DESC LIMIT ?`)
       .all(sessionId, seq, before) as Array<Record<string, unknown>>
-    const afterRows = this.db.prepare(`SELECT session_id, seq, kind, time, turn, text_main, text_tool
-      FROM messages WHERE session_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`)
+    const afterRows = this.db.prepare(`SELECT m.seq, m.kind, m.time, m.turn, m.text_main, m.text_tool
+      FROM session_messages sm JOIN messages m ON m.content_id = sm.content_id
+      WHERE sm.session_id = ? AND m.seq > ? ORDER BY m.seq ASC LIMIT ?`)
       .all(sessionId, seq, after) as Array<Record<string, unknown>>
 
-    const session = this.db.prepare('SELECT title, cwd FROM sessions WHERE session_id = ?').get(sessionId) as
+    const session = this.db.prepare('SELECT title, cwd, subagent_kind, parent_session_id FROM sessions WHERE session_id = ?').get(sessionId) as
       | Record<string, unknown>
       | undefined
 
@@ -439,6 +559,8 @@ export class SessionIndex {
       sessionId,
       sessionTitle: session?.title === null || session?.title === undefined ? null : String(session?.title ?? null),
       cwd: session?.cwd === null || session?.cwd === undefined ? null : String(session?.cwd ?? null),
+      child: session?.subagent_kind === 'child',
+      parentSessionId: session?.parent_session_id == null ? null : String(session.parent_session_id),
       focus: toMessage(focus),
       context: [...beforeRows.reverse(), ...afterRows].map(toMessage),
     }
@@ -478,7 +600,7 @@ export class SessionIndex {
 
   /** 会话的索引行数（测试/诊断用）。 */
   countMessages(sessionId: string): number {
-    const row = this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(sessionId) as { n: number }
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM session_messages WHERE session_id = ?').get(sessionId) as { n: number }
     return row.n
   }
 
@@ -541,11 +663,31 @@ export class SessionIndex {
       this.db.exec(`INSERT INTO messages_fts(messages_fts, rowid, text_main, text_tool)
         SELECT 'delete', rowid, text_main, text_tool FROM messages`)
       this.db.exec('DELETE FROM messages')
+      this.db.exec('DELETE FROM session_messages')
       this.db.exec('DELETE FROM sessions')
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  /**
+   * 索引库维护：FTS merge/optimize 回收倒排空洞 + WAL checkpoint 截断。
+   * 在同步事务完成后调用（低频：增量同步后 / rebuild 后），避开写高峰。
+   * 失败静默（维护是尽力而为，不影响主流程）。
+   */
+  maintain(): { optimized: boolean; checkpointed: boolean } {
+    let optimized = false
+    let checkpointed = false
+    try {
+      this.db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('optimize')`)
+      optimized = true
+    } catch { /* FTS optimize 失败不影响主流程 */ }
+    try {
+      this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+      checkpointed = true
+    } catch { /* WAL 可能被并发读占用 */ }
+    return { optimized, checkpointed }
   }
 }

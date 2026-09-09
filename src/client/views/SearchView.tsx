@@ -12,8 +12,8 @@ export interface SearchViewProps {
   client: ExplorerClient
   /** 点击结果 → 预览。 */
   onPreview: (hit: MessageHit) => void
-  /** 打开会话（跳到真实会话）。 */
-  onOpenSession: (sessionId: string) => void
+  /** 打开会话并定位到命中消息（含子代理路由信息）。 */
+  onOpenSession: (hit: MessageHit) => void
   /** DSH Host locale 服务（缺省回退 navigator.language）。 */
   locale?: import('../i18n.js').LocaleServiceLike
 }
@@ -138,10 +138,10 @@ export function SearchView({ client, onPreview, onOpenSession, locale }: SearchV
                   className="sex-mini-btn"
                   onClick={(event) => {
                     event.stopPropagation()
-                    onOpenSession(item.sessionId)
+                    onOpenSession(item)
                   }}
                 >
-                  {t('openSession')}
+                  {t('openSessionAt')}
                 </button>
               </div>
             </div>

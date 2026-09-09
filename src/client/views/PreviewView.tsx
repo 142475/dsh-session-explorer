@@ -12,7 +12,8 @@ export interface PreviewViewProps {
   sessionId: string
   seq: number
   onBack: () => void
-  onOpenSession: (sessionId: string) => void
+  /** 打开会话并定位到焦点消息（含子代理路由信息）。 */
+  onOpenSession: (hit: { sessionId: string; seq: number; turn: number | null; snippet: string; child?: boolean; parentSessionId?: string | null }) => void
   /** DSH Host locale 服务（缺省回退 navigator.language）。 */
   locale?: LocaleServiceLike
 }
@@ -103,7 +104,23 @@ export function PreviewView({ client, sessionId, seq, onBack, onOpenSession, loc
           <span className="sex-hit-title">{page.sessionTitle ?? t('noTitle')}</span>
           <span className="sex-hit-meta">{page.cwd ?? ''}</span>
         </div>
-        <button type="button" className="sex-mini-btn" onClick={() => { onOpenSession(sessionId) }}>{t('openSession')}</button>
+        <button
+          type="button"
+          className="sex-mini-btn"
+          onClick={() => {
+            const focus = page.focus
+            onOpenSession({
+              sessionId,
+              seq: focus.seq,
+              turn: focus.turn,
+              snippet: focus.textMain || focus.textTool,
+              child: page.child,
+              parentSessionId: page.parentSessionId,
+            })
+          }}
+        >
+          {t('openSessionAt')}
+        </button>
       </div>
       <div className="sex-preview-scroll">
         {before.map((message) => <MessageRow key={message.seq} message={message} focused={false} t={t} />)}

@@ -165,7 +165,11 @@ export function apply(ctx: CtxLike) {
     }
   }
 
-  const persistence = ctx.get('sessionPersistence') as PersistenceLike | undefined
+  // 实时获取 persistence：cordis 树并发装配下，本 entry apply 执行时
+  // session-persistence-jsonl 可能尚未 mount（alpha.4+ 装配时序变化）；
+  // closure 快照会把 undefined 永久捕获，导致 sync 静默失效、rebuild 报错。
+  const persistenceOf = (): PersistenceLike | undefined =>
+    ctx.get('sessionPersistence') as PersistenceLike | undefined
   const agentsOf = () => (ctx.get('agents') as AgentsLike | undefined)?.roots?.() ?? []
 
   try {
@@ -177,6 +181,7 @@ export function apply(ctx: CtxLike) {
 
   // 面板打开时同步：live 会话 + 从未索引的新会话（串行，量小安全）。
   const syncNow = async (): Promise<SyncResponse> => {
+    const persistence = persistenceOf()
     if (!persistence?.inspect) return { synced: 0, failed: 0 }
     const targets = new Set<string>()
     for (const agent of agentsOf()) {
@@ -227,6 +232,7 @@ export function apply(ctx: CtxLike) {
     },
     indexStatus: async (): Promise<IndexStatus> => {
       if (!index) throw new Error('index unavailable')
+      const persistence = persistenceOf()
       const ids = persistence ? await listSessionIds(persistence) : []
       return index.indexStatus(ids)
     },
@@ -240,8 +246,9 @@ export function apply(ctx: CtxLike) {
     },
     rebuild: async (request: RebuildRequest): Promise<RebuildResponse> => {
       if (!index) throw new Error('index unavailable')
+      const persistence = persistenceOf()
       if (!persistence?.inspect) {
-        throw new Error('sessionPersistence.inspect is not available in this build')
+        throw new Error('sessionPersistence.inspect is not available (service not mounted yet)')
       }
       const ids = await listSessionIds(persistence)
       const failures: RebuildResponse['failures'] = []
@@ -304,7 +311,7 @@ export function apply(ctx: CtxLike) {
           }
           // 其余情况：未索引 / revision 变化 / revision 缺失（老库）→ 重刷
           try {
-            const inspection = await persistence.inspect!(id)
+            const inspection = await persistenceOf()!.inspect!(id)
             const events = (inspection.events ?? []) as SessionEventLike[]
             const folded = foldSession(id, events as never[])
             const title = foldTitle(events as never[])
@@ -332,11 +339,14 @@ export function apply(ctx: CtxLike) {
           }
         }
       }
+      // 重建后做一次 FTS optimize + WAL 截断（大事务写入后回收膨胀）
+      try { index.maintain() } catch { /* 维护尽力而为 */ }
       return { mode, total: ids.length, added, removed, refreshed, skipped, succeeded, failed, failures }
     },
   }
 
   const onTurnStopping = (payload?: unknown) => {
+    const persistence = persistenceOf()
     if (!index || !persistence?.inspect || syncing) return
     const agent = payload as AgentLike | undefined
     const id = sessionIdOf(agent?.session?.id)
@@ -370,13 +380,32 @@ export function apply(ctx: CtxLike) {
     if (agent) attachAgent(agent)
   })
 
-  if (persistence?.inspect) {
-    for (const agent of (ctx.get('agents') as AgentsLike | undefined)?.roots?.() ?? []) attachAgent(agent)
+  // 启动期 persistence 可能晚于本 entry mount：给一轮有限等待。
+  const waitForPersistence = async (deadlineMs: number): Promise<PersistenceLike | undefined> => {
+    if (persistenceOf()?.inspect) return persistenceOf()
+    const started = Date.now()
+    while (Date.now() - started < deadlineMs && !disposed) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      if (persistenceOf()?.inspect) return persistenceOf()
+    }
+    return persistenceOf()
   }
 
-  // 启动对账：把新出现的会话索引起来（失败不阻塞）。
+  // 首个 persistence 就绪后补挂既有 roots 的事件监听（apply 时可能还没就绪）。
   void (async () => {
-    if (!index || !persistence?.inspect) return
+    const persistence = await waitForPersistence(10_000)
+    if (!persistence?.inspect || disposed) return
+    for (const agent of (ctx.get('agents') as AgentsLike | undefined)?.roots?.() ?? []) attachAgent(agent)
+  })()
+
+  // 启动对账：把新出现的会话索引起来（失败不阻塞；等 persistence 就绪再跑）。
+  void (async () => {
+    if (!index) return
+    const persistence = await waitForPersistence(10_000)
+    if (!persistence?.inspect) {
+      warnOnce('persistence', 'sessionPersistence not mounted within 10s; sync/rebuild disabled for this boot')
+      return
+    }
     try {
       const ids = await listSessionIds(persistence)
       for (const id of ids) {
