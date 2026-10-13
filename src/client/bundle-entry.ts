@@ -284,7 +284,7 @@ export function factory(require: (spec: string) => unknown) {
     const onOpenSession = (sessionId: string) => {
       if (ctx.uiWorkspace?.openSession) ctx.uiWorkspace.openSession(sessionId)
       else ctx.sessions?.open?.(sessionId)
-      store.close()
+      // A 方案：切会话但不关面板（面板随即切到该消息的上下文预览）
     }
 
     // CSS 幂等注入
