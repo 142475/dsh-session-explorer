@@ -61,6 +61,7 @@ export function PreviewView({ client, sessionId, seq, onBack, onOpenSession, loc
   const { t } = useI18n(locale)
   const [state, setState] = useState<{ status: 'loading' | 'ready' | 'error'; page: PreviewPage | null; error: string | null }>({ status: 'loading', page: null, error: null })
   const focusEl = useRef<HTMLDivElement | null>(null)
+  const autoScrolled = useRef(false)
 
   useEffect(() => {
     let cancelled = false
@@ -78,11 +79,12 @@ export function PreviewView({ client, sessionId, seq, onBack, onOpenSession, loc
       }
     })()
     return () => { cancelled = true }
-  }, [client, sessionId, seq, t])
+  }, [client, sessionId, seq])
 
   // 焦点消息渲染后自动滚动定位到可视区中央（不跳转真实会话，仅面板内定位）。
   useEffect(() => {
-    if (state.status === 'ready' && state.page && focusEl.current) {
+    if (state.status === 'ready' && state.page && focusEl.current && !autoScrolled.current) {
+      autoScrolled.current = true
       focusEl.current.scrollIntoView({ block: 'center', behavior: 'auto' })
     }
   }, [state])
