@@ -7,6 +7,7 @@
 import { createElement, useState, useEffect, useSyncExternalStore, useCallback } from 'react'
 import type {
   ExplorerRpc,
+  JumpReport,
   IndexStatus,
   MessageHit,
   PreviewPage,
@@ -94,6 +95,8 @@ export interface ExplorerClient {
     failed: number
     failures: Array<{ sessionId: string; indexed: boolean; error?: string }>
   }>>
+  /** 临时诊断：定位结果上报（host 写进 %TEMP%\se-probe.log）。 */
+  jumpReport(report: JumpReport): Promise<RpcEnvelope<{ ok: true }>>
 }
 
 /**
@@ -111,6 +114,7 @@ export function createExplorerClient(connection: unknown, channel: string): Expl
   const call = (method: string, payload?: unknown): Promise<unknown> => rpc.call!(channel, method, payload === undefined ? {} : payload)
   return {
     search: (request) => call('search', request) as Promise<RpcEnvelope<SearchResponse>>,
+    jumpReport: (report) => call('jumpReport', report) as Promise<RpcEnvelope<{ ok: true }>>,
     timeline: (options) => call('timeline', options ?? {}) as Promise<RpcEnvelope<TimelineNode[]>>,
     turns: (sessionId, limit) => call('turns', limit ? { sessionId, limit } : { sessionId }) as Promise<RpcEnvelope<TimelineTurnsResponse>>,
     preview: (sessionId, seq, before, after) => call('preview', { sessionId, seq, before, after }) as Promise<RpcEnvelope<PreviewPage | null>>,

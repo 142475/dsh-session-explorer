@@ -13,6 +13,7 @@ import { createElement } from 'react'
 import type { ExplorerClient, PanelStore } from './store.js'
 import { createExplorerClient, createPanelStore, usePanelStore } from './store.js'
 import { App } from './App.js'
+import { reportJumpFetch, setJumpReporter } from './jump.js'
 import type { LocaleServiceLike } from './i18n.js'
 import styles from './styles.css'
 
@@ -49,6 +50,8 @@ interface SessionsLike {
 interface ClientCtxLike {
   connection?: ConnectionLike
   sessions?: SessionsLike
+  /** 0.2.x 官方会话切换服务（openSession(SessionId | SubagentAddress)）。 */
+  uiWorkspace?: { openSession?: (target: unknown) => void }
   effect?: (dispose: () => unknown, label: string) => void
   /** cordis client ctx：取注入的服务（locale 等）。 */
   get?: (service: string) => unknown
@@ -173,6 +176,7 @@ function mountPanel(
   store: PanelStore,
   onOpenSession: (id: string) => void,
   sessions: SessionsLike | undefined,
+  uiWorkspace: { openSession?: (target: unknown) => void } | undefined,
   reactDomClient: { createRoot: (el: Element) => ReactRootLike },
   Tooltip?: unknown,
   locale?: unknown,
@@ -200,6 +204,7 @@ function mountPanel(
       store,
       onOpenSession,
       sessions: sessions as import('./jump.js').JumpSessionsLike | undefined,
+      uiWorkspace,
       onClose: () => { store.close() },
       Tooltip,
       locale: locale as LocaleServiceLike | undefined,
@@ -269,9 +274,16 @@ export function factory(require: (spec: string) => unknown) {
     const locale = ctx.get?.('locale') as { subscribe?: (fn: () => void) => () => void; getSnapshot?: () => { active: string; revision: number } } | undefined
 
     const client = createExplorerClient(ctx.connection, CHANNEL)
+    // 临时诊断（验证完删除）：定位结果经引擎 RPC 通道上报 + 启动时两条通道各报一次做对照
+    setJumpReporter((report) => {
+      void client.jumpReport(report).catch(() => undefined)
+    })
+    void client.jumpReport({ stage: 'boot-engine', sessionId: '-' }).catch(() => undefined)
+    reportJumpFetch('boot-fetch', '-')
     const store = createPanelStore()
     const onOpenSession = (sessionId: string) => {
-      ctx.sessions?.open?.(sessionId)
+      if (ctx.uiWorkspace?.openSession) ctx.uiWorkspace.openSession(sessionId)
+      else ctx.sessions?.open?.(sessionId)
       store.close()
     }
 
@@ -294,7 +306,7 @@ export function factory(require: (spec: string) => unknown) {
     applyEntry()
     const unsubscribeLocale = locale?.subscribe?.(applyEntry)
 
-    const disposePanel = mountPanel(client, store, onOpenSession, ctx.sessions, reactDomClient, Tooltip, locale)
+    const disposePanel = mountPanel(client, store, onOpenSession, ctx.sessions, ctx.uiWorkspace, reactDomClient, Tooltip, locale)
     ctx.effect?.(() => () => {
       unsubscribeLocale?.()
       disposePanel()
@@ -303,6 +315,6 @@ export function factory(require: (spec: string) => unknown) {
   }
 
   bundleModule.exports.apply = apply
-  bundleModule.exports.inject = ['connection', 'sessions', 'locale']
+  bundleModule.exports.inject = ['connection', 'sessions', 'locale', 'uiWorkspace']
   return bundleModule.exports
 }

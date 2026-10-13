@@ -8,7 +8,7 @@ import { envelopeError, usePanelStore } from './store.js'
 import { SearchView } from './views/SearchView.js'
 import { TimelineView } from './views/TimelineView.js'
 import { PreviewView } from './views/PreviewView.js'
-import { jumpToSession, probeFromSnippet, type JumpSessionsLike } from './jump.js'
+import { jumpToSession, probeFromSnippet, reportJump, type JumpSessionsLike, type JumpUiWorkspaceLike } from './jump.js'
 import type { IndexStatus, MessageHit, TimelineNode, TimelineTurnsResponse } from '../protocol.js'
 import { useI18n, type LocaleServiceLike } from './i18n.js'
 
@@ -19,6 +19,8 @@ export interface AppProps {
   onOpenSession: (sessionId: string) => void
   /** bundle-entry 注入的 sessions 服务（带锚点跳原会话用）。 */
   sessions?: JumpSessionsLike
+  /** bundle-entry 注入的 uiWorkspace 服务（0.2.x 官方会话切换入口）。 */
+  uiWorkspace?: JumpUiWorkspaceLike
   onClose: () => void
   /** DSH 平台 Tooltip 组件（由 bundle-entry 从 primitives seed 注入）。 */
   Tooltip?: unknown
@@ -31,7 +33,7 @@ type View =
   | { name: 'timeline' }
   | { name: 'preview'; sessionId: string; seq: number }
 
-export function App({ client, store, onOpenSession, sessions, onClose, Tooltip, locale }: AppProps) {
+export function App({ client, store, onOpenSession, sessions, uiWorkspace, onClose, Tooltip, locale }: AppProps) {
   const panel = usePanelStore(store)
   const { t } = useI18n(locale)
   const [view, setView] = useState<View>({ name: 'search' })
@@ -173,9 +175,10 @@ export function App({ client, store, onOpenSession, sessions, onClose, Tooltip, 
   /** 带锚点跳原会话：切换会话并尽量定位到命中消息（主/子代理自动路由）。 */
   const openSessionAt = useCallback((hit: { sessionId: string; seq: number; turn: number | null; snippet: string; child?: boolean; parentSessionId?: string | null }) => {
     setJumpNotice(null)
+    reportJump('click-openSessionAt', hit.sessionId, { probe: probeFromSnippet(hit.snippet) })
     void jumpToSession(sessions ?? {}, {
       sessionId: hit.sessionId,
-      target: { seq: hit.seq, turn: hit.turn, probe: probeFromSnippet(hit.snippet) },
+      target: { seq: hit.seq, turn: hit.turn, probe: probeFromSnippet(hit.snippet), time: hit.time },
       child: hit.child === true,
       parentSessionId: hit.parentSessionId ?? null,
     }, {
@@ -185,8 +188,14 @@ export function App({ client, store, onOpenSession, sessions, onClose, Tooltip, 
         notInList: t('jumpNotInList'),
         openFailed: t('jumpOpenFailed'),
       },
+      uiWorkspace,
+    }).catch((error: unknown) => {
+      reportJump('jump-threw', hit.sessionId, {
+        probe: probeFromSnippet(hit.snippet),
+        detail: error instanceof Error ? error.message : String(error),
+      })
     })
-  }, [sessions, store, t])
+  }, [sessions, uiWorkspace, store, t])
 
   if (!panel.open) return null
 
