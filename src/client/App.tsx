@@ -172,17 +172,6 @@ export function App({ client, store, onOpenSession, sessions, uiWorkspace, onClo
   const [jumpNotice, setJumpNotice] = useState<string | null>(null)
   const clearJumpNotice = useCallback(() => { setJumpNotice(null) }, [])
 
-  /**
-   * A 方案（面板内定位）：切到目标会话，但**不关面板**，直接在面板里显示该消息的前后上下文并高亮。
-   * 数据来自宿主 preview 端点，与引擎的分页渲染无关 ⇒ 今天/上周/上月一样准。
-   */
-  const revealAt = useCallback((hit: { sessionId: string; seq: number }) => {
-    setJumpNotice(null)
-    reportJump('reveal-in-panel', hit.sessionId, { seq: hit.seq })
-    onOpenSession(hit.sessionId)
-    setView({ name: 'preview', sessionId: hit.sessionId, seq: hit.seq })
-  }, [onOpenSession])
-
   /** 带锚点跳原会话：切换会话并尽量定位到命中消息（主/子代理自动路由）。 */
   const openSessionAt = useCallback((hit: { sessionId: string; seq: number; turn: number | null; snippet: string; child?: boolean; parentSessionId?: string | null }) => {
     setJumpNotice(null)
@@ -267,7 +256,7 @@ export function App({ client, store, onOpenSession, sessions, uiWorkspace, onClo
         </div>
       )}
       <div className="sex-body">
-        {view.name === 'search' && <SearchView client={client} onPreview={openPreviewFromHit} onOpenSession={revealAt} locale={locale} />}
+        {view.name === 'search' && <SearchView client={client} onPreview={openPreviewFromHit} onOpenSession={openSessionAt} locale={locale} />}
         {view.name === 'timeline' && (timeline.status === 'loading'
           ? <div className="sex-empty">{t('loadingTimeline')}</div>
           : timeline.status === 'error'
