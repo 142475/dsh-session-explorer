@@ -256,7 +256,10 @@ export function App({ client, store, onOpenSession, sessions, uiWorkspace, onClo
         </div>
       )}
       <div className="sex-body">
-        {view.name === 'search' && <SearchView client={client} onPreview={openPreviewFromHit} onOpenSession={openSessionAt} locale={locale} />}
+        {/* 常驻挂载：切到预览/时间线时只隐藏，保证搜索词与结果不丢（点结果再返回时不清空） */}
+        <div style={{ display: view.name === 'search' ? undefined : 'none' }}>
+          <SearchView client={client} onPreview={openPreviewFromHit} onOpenSession={openSessionAt} locale={locale} />
+        </div>
         {view.name === 'timeline' && (timeline.status === 'loading'
           ? <div className="sex-empty">{t('loadingTimeline')}</div>
           : timeline.status === 'error'

@@ -79,17 +79,50 @@ function newSessionButton(root: HTMLElement): HTMLButtonElement | undefined {
 const HISTORY_ICON = '<svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75V8l2.25 1.5"/></svg>'
 
 function createEntry(store: PanelStore, label: string): HTMLButtonElement {
-  const entry = document.createElement('button')
-  entry.type = 'button'
+  // 克隆宿主侧栏最后一行（MCP 连接器）的结构与 class，保证对齐、字体、间距与内置项一致。
+  const donor = builtinRows().pop()
+  const clone = donor === undefined ? null : (donor.cloneNode(true) as HTMLElement)
+  const entry = (clone instanceof HTMLButtonElement ? clone : document.createElement('button')) as HTMLButtonElement
+  if (clone === null) entry.type = 'button'
+  entry.removeAttribute('id')
+  entry.removeAttribute('aria-controls')
+  entry.removeAttribute('aria-expanded')
   entry.setAttribute('data-dsh-session-explorer-entry', '')
   entry.setAttribute('data-dsh-plugin', 'dsh-session-explorer')
   entry.setAttribute('data-dsh-part', 'sidebar-entry')
-  entry.className = 'sex-entry'
   entry.setAttribute('aria-label', label)
   entry.setAttribute('title', label)
-  entry.innerHTML = '<span class="sex-entry-icon">' + HISTORY_ICON + '</span><span class="sex-entry-label">' + label + '</span>'
+  if (clone === null) entry.className = 'sex-entry'
+  // 只替换最内层文案节点，其余结构/图标槽沿用宿主。
+  const leaves = Array.from(entry.querySelectorAll('*')).filter(
+    (el) => el.children.length === 0 && (el.textContent ?? '').trim().length > 0,
+  )
+  const textLeaf = leaves[leaves.length - 1]
+  if (textLeaf !== undefined) textLeaf.textContent = label
+  else entry.textContent = label
+  const icon = entry.querySelector('svg')
+  if (icon !== null) {
+    const holder = document.createElement('span')
+    holder.innerHTML = HISTORY_ICON
+    const mine = holder.firstElementChild
+    if (mine !== null) icon.replaceWith(mine)
+  }
   entry.addEventListener('click', () => { store.toggle() })
   return entry
+}
+
+/** 侧栏里所有内置导航行（优先宿主 nav 行 class，排除我自己的入口）。 */
+function builtinRows(): HTMLElement[] {
+  const root = sidebarRoot()
+  if (root === undefined) return []
+  const rows = Array.from(root.querySelectorAll('button, a')).filter((el): el is HTMLElement => {
+    if (!(el instanceof HTMLElement)) return false
+    if (el.closest('[data-dsh-session-explorer-entry]') !== null) return false
+    const text = (el.textContent ?? '').trim()
+    return text.length > 0 && text.length < 24
+  })
+  const navRows = rows.filter((el) => String(el.className).includes('panelRow'))
+  return navRows.length > 0 ? navRows : rows
 }
 
 function placeEntry(root: HTMLElement, entry: HTMLElement): boolean {
@@ -99,7 +132,8 @@ function placeEntry(root: HTMLElement, entry: HTMLElement): boolean {
     const row = button.closest('[class*="logoRow"]')
     const base = row !== null && row.parentElement === root ? row : button
     const family = Array.from(root.children).filter(
-      (el): el is HTMLElement => el instanceof HTMLElement && el.matches(FAMILY_SELECTOR),
+      (el): el is HTMLElement =>
+        el instanceof HTMLElement && el !== entry && el.querySelector('[class*="panelRow"]') !== null,
     )
     const anchor = family.length > 0 ? family[family.length - 1].nextElementSibling : base.nextElementSibling
     root.insertBefore(entry, anchor)
