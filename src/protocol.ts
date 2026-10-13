@@ -136,6 +136,15 @@ export interface SearchResponse {
 /** 搜索结果条目（client 视图可直接消费）。 */
 export interface SearchResultItem extends MessageHit {}
 
+/** 客户端定位诊断上报（临时探针）。 */
+export interface JumpReport {
+  stage: string
+  sessionId: string
+  seq?: number
+  probe?: string
+  detail?: string
+}
+
 /** RPC 端点方法表（host 实现，client 消费）。 */
 export interface ExplorerRpc {
   search(request: SearchRequest): Promise<SearchResponse>
@@ -148,6 +157,8 @@ export interface ExplorerRpc {
   /** 索引库健康检查（dialog 展示用）。 */
   healthCheck(): Promise<IndexHealth>
   rebuild(request: RebuildRequest): Promise<RebuildResponse>
+  /** 客户端「打开并定位」诊断上报（临时探针，验证完删除）。 */
+  jumpReport(request: JumpReport): Promise<{ ok: true }>
 }
 
 /** 轻量同步结果。 */

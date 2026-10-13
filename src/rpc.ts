@@ -9,6 +9,7 @@
 import { z } from 'zod'
 import type {
   ExplorerRpc,
+  JumpReport,
   MessageKind,
   PreviewRequest,
   RebuildRequest,
@@ -79,6 +80,14 @@ export const previewRequestSchema = z.object({
   after: z.number().int().min(0).max(50).optional(),
 })
 
+export const jumpReportSchema = z.object({
+  stage: z.string().min(1).max(64),
+  sessionId: z.string().min(1).max(200),
+  seq: z.number().int().nonnegative().optional(),
+  probe: z.string().max(200).optional(),
+  detail: z.string().max(2000).optional(),
+})
+
 function fail(message: string): RpcResult<unknown> {
   return { ok: false, error: { code: 'bad-request', message, details: {} } }
 }
@@ -139,6 +148,11 @@ export async function dispatch(
       const parsed = validate(rebuildRequestSchema, args ?? {})
       if ('message' in parsed) return fail(parsed.message)
       return toResult(() => handlers.rebuild(parsed as RebuildRequest))
+    }
+    case 'jumpReport': {
+      const parsed = validate(jumpReportSchema, args)
+      if (!('stage' in parsed)) return fail(parsed.message)
+      return toResult(() => handlers.jumpReport(parsed as JumpReport))
     }
     default:
       return fail('unknown method: ' + method)
