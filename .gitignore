@@ -3,3 +3,6 @@ lib/
 dist/
 *.tgz
 *.log
+*.tsbuildinfo
+.DS_Store
+Thumbs.db

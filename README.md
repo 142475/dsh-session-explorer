@@ -75,3 +75,29 @@ See the `assets/` directory for installation, search, and timeline overview scre
 ## License
 
 MIT
+
+## Fork notes — DeepSeek Harness 0.2.x compatibility
+
+This fork ports the plugin to DSH `0.2.0-rc.2`. On 0.2.x the upstream code loaded but did nothing: empty index, `HTTP 405` on the RPC channel, "open & locate" dead.
+
+### What changed
+| Area | 0.1.x (upstream) | 0.2.x (this fork) |
+| --- | --- | --- |
+| Read session history | `sessionPersistence.inspect(id)` | `open(id, 'read')` + `handle.read()` -> `{ eventState, events }`, meta from `stat(id).header` |
+| RPC channel | `connection.rpc.handle(channel, handler, { authority: 'loopback' })` | `webServer.register({ kind: 'prefix', path: channel, handler })`, replicating the `/api` transport (415 / 400 / 413 / 500, `{ type: 'server-response', rpcId, result }`) |
+| Open a session from the client | `sessions.open(id)` / `openSubagent` | `uiWorkspace.openSession(target)` (client inject now includes `uiWorkspace`) |
+| Open & locate | scroll to the hit message via DOM anchors | switch session + scroll the conversation to the bottom, no flashing |
+| Preview scrolling | auto-scrolled to the focus message on every render | scrolls once; the fetch effect no longer depends on `t` |
+
+### Behaviour notes
+- The conversation view is a paged window and old turns collapse into summary rows, so locating an arbitrary historical message in the conversation DOM is not reliable. "Open & locate" switches to the session and scrolls to the bottom; read the hit in the panel preview (host `preview` endpoint), which shows the message with its surrounding context.
+- The index lives at `<dshHome>/storages/session-explorer.sqlite` (FTS5, `tokenize='trigram'`). Quote your query to search literally.
+
+### Install from this fork
+`lib/` is git-ignored, so build before installing (a plain `github:` install ships no bundle):
+```
+git clone https://github.com/142475/dsh-session-explorer && cd dsh-session-explorer
+pnpm install
+node node_modules/typescript/bin/tsc -p tsconfig.json
+node scripts/build-client.mjs
+```

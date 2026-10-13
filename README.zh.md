@@ -75,3 +75,17 @@ pnpm build     # tsc + rolldown client bundle
 ## 许可证
 
 MIT
+
+## 本 fork 的改动 —— 适配 DeepSeek Harness 0.2.x
+
+上游面向 DSH `0.1.x`；在 `0.2.0-rc.2` 上插件能挂载但不干活：索引空、RPC 通道 `HTTP 405`、「打开并定位」点了没反应。
+
+| 位置 | 0.1.x（上游） | 0.2.x（本 fork） |
+| --- | --- | --- |
+| 读会话历史 | `sessionPersistence.inspect(id)` | `open(id,'read')` + `handle.read()` -> `{ eventState, events }`，meta 取自 `stat(id).header` |
+| RPC 通道 | `connection.rpc.handle(channel, handler, { authority: 'loopback' })` | `webServer.register({ kind:'prefix', path: channel, handler })`，逐分支复刻 `/api` 传输语义 |
+| 客户端切会话 | `sessions.open(id)` / `openSubagent` | `uiWorkspace.openSession(target)`（客户端 inject 增加 `uiWorkspace`） |
+| 打开并定位 | 按 DOM 锚点滚到那条消息 | 切到目标会话 + 滚到对话底部，不闪烁 |
+| 预览页滚动 | 每次渲染都自动滚到焦点消息（滚动被反复拉回） | 只滚一次；拉取 effect 不再依赖 `t` |
+
+说明：对话流是分页窗口、老轮次折叠成摘要行 ⇒ 在对话里精确落到任意历史消息不可靠；命中内容请在面板预览里读（宿主 `preview` 端点，带前后上下文）。索引库在 `<dshHome>/storages/session-explorer.sqlite`（FTS5，`tokenize='trigram'`）。`lib/` 被 git 忽略，从本仓库安装前需先构建。
