@@ -649,6 +649,13 @@ export async function jumpToSession(
       reportJump('no-scroller', sessionId, { probe: target.probe, detail: jumpDiagnostics(target.probe ?? '') })
       return 'opened'
     }
+    // 只跳到底部：不再找具体那条消息（分页窗口 + 折叠行让精确定位不可靠），也不闪烁高亮。
+    for (let i = 0; i < 6; i += 1) {
+      scroller.scrollTop = scroller.scrollHeight
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+    reportJump('scrolled-bottom', sessionId, { seq: target.seq, detail: 'top=' + Math.round(scroller.scrollTop) })
+    return 'scrolled'
     // 1) 按引擎事件窗口里的 seq 位置寻址（虚拟列表近似线性），必要时先点「加载更早」。
     for (let round = 0; round < SEEK_ROUNDS; round += 1) {
       const win = eventWindow(sessions, sessionId)
