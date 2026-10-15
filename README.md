@@ -88,6 +88,8 @@ This fork ports the plugin to DSH `0.2.0-rc.2`. On 0.2.x the upstream code loade
 | Open a session from the client | `sessions.open(id)` / `openSubagent` | `uiWorkspace.openSession(target)` (client inject now includes `uiWorkspace`) |
 | Open & locate | scroll to the hit message via DOM anchors | switch session + scroll the conversation to the bottom, no flashing |
 | Preview scrolling | auto-scrolled to the focus message on every render | scrolls once; the fetch effect no longer depends on `t` |
+| Sidebar entry | plain text row: no icon, own font and colour | clones the host's nav row (icon, font, colour, padding all inherited), swapped to a magnifier icon; rebuilt automatically once the host row exists |
+| Panel state | the search view was unmounted when switching to preview/timeline | all views stay mounted (`display:none`), so the query and its results survive |
 
 ### Behaviour notes
 - The conversation view is a paged window and old turns collapse into summary rows, so locating an arbitrary historical message in the conversation DOM is not reliable. "Open & locate" switches to the session and scrolls to the bottom; read the hit in the panel preview (host `preview` endpoint), which shows the message with its surrounding context.

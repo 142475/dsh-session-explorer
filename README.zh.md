@@ -87,5 +87,7 @@ MIT
 | 客户端切会话 | `sessions.open(id)` / `openSubagent` | `uiWorkspace.openSession(target)`（客户端 inject 增加 `uiWorkspace`） |
 | 打开并定位 | 按 DOM 锚点滚到那条消息 | 切到目标会话 + 滚到对话底部，不闪烁 |
 | 预览页滚动 | 每次渲染都自动滚到焦点消息（滚动被反复拉回） | 只滚一次；拉取 effect 不再依赖 `t` |
+| 侧栏入口 | 纯文本行：没有图标，字体/颜色与内置行不一致 | 克隆宿主导航行（图标/字体/颜色/内边距全继承），图标换成放大镜；宿主行晚渲染时自动重建 |
+| 面板状态 | 切到「预览/时间线」时搜索视图被卸载（搜索词与结果丢失） | 视图常驻（`display:none`），搜索词与结果保留 |
 
 说明：对话流是分页窗口、老轮次折叠成摘要行 ⇒ 在对话里精确落到任意历史消息不可靠；命中内容请在面板预览里读（宿主 `preview` 端点，带前后上下文）。索引库在 `<dshHome>/storages/session-explorer.sqlite`（FTS5，`tokenize='trigram'`）。`lib/` 被 git 忽略，从本仓库安装前需先构建。
