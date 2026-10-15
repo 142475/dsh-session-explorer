@@ -75,8 +75,8 @@ function newSessionButton(root: HTMLElement): HTMLButtonElement | undefined {
   return undefined
 }
 
-/** Outline 历史图标（stroke 1.5，与宿主侧栏导航图标同风格）。 */
-const HISTORY_ICON = '<svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75V8l2.25 1.5"/></svg>'
+/** 入口图标：放大镜（stroke 1.5，用 currentColor 跟随宿主行的字体颜色）。 */
+const ENTRY_ICON = '<svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.9" cy="6.9" r="4.4"/><path d="M10.3 10.3 14 14"/></svg>'
 
 function createEntry(store: PanelStore, label: string): HTMLButtonElement {
   // 克隆宿主侧栏最后一行（MCP 连接器）的结构与 class，保证对齐、字体、间距与内置项一致。
@@ -93,6 +93,7 @@ function createEntry(store: PanelStore, label: string): HTMLButtonElement {
   entry.setAttribute('aria-label', label)
   entry.setAttribute('title', label)
   if (clone === null) entry.className = 'sex-entry'
+  else entry.dataset.donor = 'true'
   // 只替换最内层文案节点，其余结构/图标槽沿用宿主。
   const leaves = Array.from(entry.querySelectorAll('*')).filter(
     (el) => el.children.length === 0 && (el.textContent ?? '').trim().length > 0,
@@ -101,11 +102,13 @@ function createEntry(store: PanelStore, label: string): HTMLButtonElement {
   if (textLeaf !== undefined) textLeaf.textContent = label
   else entry.textContent = label
   const icon = entry.querySelector('svg')
-  if (icon !== null) {
-    const holder = document.createElement('span')
-    holder.innerHTML = HISTORY_ICON
-    const mine = holder.firstElementChild
-    if (mine !== null) icon.replaceWith(mine)
+  const holder = document.createElement('span')
+  holder.innerHTML = ENTRY_ICON
+  const mine = holder.firstElementChild
+  if (mine !== null) {
+    // 克隆到宿主行时替换它自己的图标；退化路径（还没拿到 donor）则自己插一个，保证入口一定有图标。
+    if (icon !== null) icon.replaceWith(mine)
+    else entry.insertBefore(mine, entry.firstChild)
   }
   entry.addEventListener('click', () => { store.toggle() })
   return entry
@@ -143,11 +146,21 @@ function placeEntry(root: HTMLElement, entry: HTMLElement): boolean {
 
 function mountSidebarEntry(store: PanelStore, label: string): () => void {
   if (document.querySelector(ENTRY_SELECTOR) !== null) return () => {}
-  const entry = createEntry(store, label)
+  let entry = createEntry(store, label)
   let root: HTMLElement | undefined
   let placed = false
   let rootObserver: MutationObserver | undefined
   const tryPlace = (): void => {
+    // 宿主侧栏行可能比插件晚渲染：那一刻 createEntry 只能退化自绘（无图标、字体/颜色与内置行不一致）。
+    // 一旦拿到 donor 就重建入口，保证与「MCP 连接器」等宿主行完全同款。
+    if (entry.dataset.donor !== 'true' && builtinRows().length > 0) {
+      const rebuilt = createEntry(store, label)
+      if (rebuilt.dataset.donor === 'true') {
+        entry.replaceWith(rebuilt)
+        entry = rebuilt
+        placed = false
+      }
+    }
     if (root !== undefined && !root.isConnected) {
       rootObserver?.disconnect()
       root = undefined
